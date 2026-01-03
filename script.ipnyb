@@ -1,0 +1,513 @@
+#######################################################################################
+# Google Drive Lyrics Embedding Script
+# Jacopo Mazzoni 2026
+# multi-format lyric embedding with persistent log + Drive-safe writes
+# Supports: MP3 (ID3), FLAC (Vorbis comments), OGG/Vorbis (.ogg/.oga), OPUS (.opus),
+#           M4A/MP4 (MP4 atoms, includes most "AAC" in .m4a/.mp4 containers)
+
+!pip -q install mutagen requests
+
+import os, re, time, shutil, uuid, json
+import requests
+from urllib.parse import quote
+
+from mutagen.id3 import ID3, ID3NoHeaderError, USLT, Encoding
+from mutagen.flac import FLAC
+from mutagen.oggvorbis import OggVorbis
+from mutagen.oggopus import OggOpus
+from mutagen.mp4 import MP4, MP4StreamInfoError
+
+# ----------------------------
+# Config
+# ----------------------------
+SUPPORTED_EXTS = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".mp4", ".aac"}
+SLEEP_BETWEEN_REQUESTS_SEC = 0.15
+
+# Free lyric sources (no API key)
+LRCLIB_GET_URL = "https://lrclib.net/api/get"
+LYRICS_OVH_URL = "https://api.lyrics.ovh/v1/{artist}/{title}"
+
+# Drive-safe writing (copy to local, edit, copy back)
+LOCAL_WORKDIR = "/content/_lyrics_work"
+os.makedirs(LOCAL_WORKDIR, exist_ok=True)
+
+# Persistent log (on Drive)
+LOG_PATH = "/content/drive/MyDrive/lyrics_log.json"
+
+# Log batching
+LOG_FLUSH_EVERY = 25
+LOG_FLUSH_SECONDS = 20
+
+# Fast skip without touching filesystem
+SKIP_STAT_IF_STATUS_IN = {"embedded", "already_present"}
+
+# If you want to retry files previously marked lyrics_not_found:
+RETRY_LYRICS_NOT_FOUND = False
+
+# Progress tracking (console)
+PROGRESS_EVERY = 25          # print progress every N supported files processed
+HEARTBEAT_SECONDS = 10       # also print progress at least every N seconds, even if stuck on one file
+
+# ----------------------------
+# Log helpers
+# ----------------------------
+def load_log():
+    if os.path.exists(LOG_PATH):
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            bak = LOG_PATH + f".corrupt_{int(time.time())}.bak"
+            try:
+                shutil.copy2(LOG_PATH, bak)
+            except Exception:
+                pass
+            return {}
+    return {}
+
+def save_log_atomic(log):
+    tmp = LOG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, LOG_PATH)
+
+def file_signature(path):
+    st = os.stat(path)
+    return {"size": st.st_size, "mtime": int(st.st_mtime)}
+
+# ----------------------------
+# Metadata helpers
+# ----------------------------
+def clean_str(s):
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+def parse_artist_title_from_filename(path):
+    base = os.path.splitext(os.path.basename(path))[0]
+    base = re.sub(r"^\s*\d+\s*[-_.]?\s*", "", base)
+    if " - " in base:
+        a, t = base.split(" - ", 1)
+        return clean_str(a), clean_str(t)
+    return "", ""
+
+def get_first(v):
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)) and v:
+        return clean_str(v[0])
+    return clean_str(v)
+
+def vorbis_get(audio, key):
+    # Vorbis comment keys are case-insensitive in practice; mutagen normalizes to lowercase.
+    return get_first(audio.get(key.lower()))
+
+def vorbis_has_lyrics(audio):
+    # accept LYRICS or UNSYNCEDLYRICS (some taggers use these)
+    for k in ("lyrics", "unsyncedlyrics"):
+        vals = audio.get(k)
+        if vals and any(clean_str(x) for x in vals):
+            return True
+    return False
+
+# ----------------------------
+# Lyrics fetchers
+# ----------------------------
+def fetch_lyrics_lrclib(artist, title):
+    r = requests.get(LRCLIB_GET_URL, params={"artist_name": artist, "track_name": title}, timeout=20)
+    if r.status_code != 200:
+        return ""
+    return clean_str(r.json().get("plainLyrics", ""))
+
+def fetch_lyrics_lyricsovh(artist, title):
+    url = LYRICS_OVH_URL.format(artist=quote(artist, safe=""), title=quote(title, safe=""))
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200:
+        return ""
+    return clean_str(r.json().get("lyrics", ""))
+
+def fetch_lyrics(artist, title):
+    if not artist or not title:
+        return ""
+    for fn in (fetch_lyrics_lrclib, fetch_lyrics_lyricsovh):
+        try:
+            lyr = fn(artist, title)
+            if lyr:
+                return lyr
+        except Exception:
+            pass
+        time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
+    return ""
+
+# ----------------------------
+# Drive-safe helpers
+# ----------------------------
+def is_drive_path(path):
+    return os.path.abspath(path).startswith("/content/drive/")
+
+def with_local_copy(src_path):
+    ext = os.path.splitext(src_path)[1].lower()
+    local_path = os.path.join(LOCAL_WORKDIR, f"{uuid.uuid4().hex}{ext}")
+    shutil.copy2(src_path, local_path)
+
+    def commit():
+        dst_dir = os.path.dirname(src_path)
+        tmp_dst = os.path.join(dst_dir, f".__tmp__{uuid.uuid4().hex}{ext}")
+        shutil.copy2(local_path, tmp_dst)
+        os.replace(tmp_dst, src_path)
+
+    return local_path, commit
+
+# ----------------------------
+# Handlers per container/type
+# ----------------------------
+
+# MP3 (ID3)
+def mp3_has_lyrics(path):
+    try:
+        tag = ID3(path)
+    except ID3NoHeaderError:
+        return False
+    return any(f.FrameID == "USLT" for f in tag.values())
+
+def mp3_get_artist_title(path):
+    try:
+        tag = ID3(path)
+    except ID3NoHeaderError:
+        tag = {}
+    artist = clean_str(tag.get("TPE1", [""])[0]) if "TPE1" in tag else ""
+    title  = clean_str(tag.get("TIT2", [""])[0]) if "TIT2" in tag else ""
+    return artist, title
+
+def mp3_embed_lyrics(path, lyrics):
+    try:
+        tag = ID3(path)
+    except ID3NoHeaderError:
+        tag = ID3()
+    tag.add(USLT(encoding=Encoding.UTF8, lang="eng", desc="Lyrics", text=lyrics))
+    tag.save(path)
+
+# FLAC (Vorbis comments)
+def flac_has_lyrics(path):
+    audio = FLAC(path)
+    return vorbis_has_lyrics(audio)
+
+def flac_get_artist_title(path):
+    audio = FLAC(path)
+    artist = vorbis_get(audio, "artist")
+    title  = vorbis_get(audio, "title")
+    return artist, title
+
+def flac_embed_lyrics(path, lyrics):
+    audio = FLAC(path)
+    audio["lyrics"] = [lyrics]
+    audio.save()
+
+# OGG Vorbis (Vorbis comments)
+def ogg_has_lyrics(path):
+    audio = OggVorbis(path)
+    return vorbis_has_lyrics(audio)
+
+def ogg_get_artist_title(path):
+    audio = OggVorbis(path)
+    return vorbis_get(audio, "artist"), vorbis_get(audio, "title")
+
+def ogg_embed_lyrics(path, lyrics):
+    audio = OggVorbis(path)
+    audio["lyrics"] = [lyrics]
+    audio.save()
+
+# OPUS (Vorbis comments)
+def opus_has_lyrics(path):
+    audio = OggOpus(path)
+    return vorbis_has_lyrics(audio)
+
+def opus_get_artist_title(path):
+    audio = OggOpus(path)
+    return vorbis_get(audio, "artist"), vorbis_get(audio, "title")
+
+def opus_embed_lyrics(path, lyrics):
+    audio = OggOpus(path)
+    audio["lyrics"] = [lyrics]
+    audio.save()
+
+# MP4/M4A (atoms)
+def mp4_has_lyrics(path):
+    audio = MP4(path)
+    tags = audio.tags or {}
+    lyr = tags.get("\xa9lyr")
+    return bool(lyr and any(clean_str(x) for x in lyr))
+
+def mp4_get_artist_title(path):
+    audio = MP4(path)
+    tags = audio.tags or {}
+    artist = get_first(tags.get("\xa9ART"))
+    title  = get_first(tags.get("\xa9nam"))
+    return artist, title
+
+def mp4_embed_lyrics(path, lyrics):
+    audio = MP4(path)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags["\xa9lyr"] = [lyrics]
+    audio.save()
+
+# Map extension -> handler key
+EXT_KIND = {
+    ".mp3": "mp3",
+    ".flac": "flac",
+    ".ogg": "ogg",
+    ".oga": "ogg",
+    ".opus": "opus",
+    ".m4a": "mp4",
+    ".mp4": "mp4",
+    # .aac handled specially (skip)
+}
+
+def has_lyrics_by_kind(kind, path):
+    if kind == "mp3":  return mp3_has_lyrics(path)
+    if kind == "flac": return flac_has_lyrics(path)
+    if kind == "ogg":  return ogg_has_lyrics(path)
+    if kind == "opus": return opus_has_lyrics(path)
+    if kind == "mp4":  return mp4_has_lyrics(path)
+    raise ValueError(f"Unknown kind: {kind}")
+
+def get_artist_title_by_kind(kind, path):
+    if kind == "mp3":  return mp3_get_artist_title(path)
+    if kind == "flac": return flac_get_artist_title(path)
+    if kind == "ogg":  return ogg_get_artist_title(path)
+    if kind == "opus": return opus_get_artist_title(path)
+    if kind == "mp4":  return mp4_get_artist_title(path)
+    raise ValueError(f"Unknown kind: {kind}")
+
+def embed_lyrics_by_kind(kind, path, lyrics):
+    if kind == "mp3":  return mp3_embed_lyrics(path, lyrics)
+    if kind == "flac": return flac_embed_lyrics(path, lyrics)
+    if kind == "ogg":  return ogg_embed_lyrics(path, lyrics)
+    if kind == "opus": return opus_embed_lyrics(path, lyrics)
+    if kind == "mp4":  return mp4_embed_lyrics(path, lyrics)
+    raise ValueError(f"Unknown kind: {kind}")
+
+# ----------------------------
+# Unified safe embed (Drive-safe)
+# ----------------------------
+def safe_embed(kind, path, lyrics):
+    last_err = ""
+    for i in range(1, 4):
+        try:
+            if is_drive_path(path):
+                local, commit = with_local_copy(path)
+                try:
+                    embed_lyrics_by_kind(kind, local, lyrics)
+                    commit()
+                finally:
+                    try:
+                        os.remove(local)
+                    except Exception:
+                        pass
+            else:
+                embed_lyrics_by_kind(kind, path, lyrics)
+            return True, ""
+        except Exception as e:
+            last_err = str(e)
+            print(f"  ❌ Write attempt {i}/3 failed: {last_err}")
+            time.sleep(0.8 * i)
+    return False, last_err
+
+# ----------------------------
+# Main
+# ----------------------------
+def process_folder(folder, dry_run=False, recursive=True):
+    folder = os.path.abspath(folder)
+    log = load_log()
+
+    updates_since_flush = 0
+    last_flush = time.time()
+
+    def maybe_flush(force=False):
+        nonlocal updates_since_flush, last_flush
+        if force or updates_since_flush >= LOG_FLUSH_EVERY or (time.time() - last_flush) >= LOG_FLUSH_SECONDS:
+            save_log_atomic(log)
+            updates_since_flush = 0
+            last_flush = time.time()
+
+    def log_update(path, sig, status, **extra):
+        nonlocal updates_since_flush
+        log[path] = {**sig, "status": status, "timestamp": int(time.time()), **extra}
+        updates_since_flush += 1
+        maybe_flush(False)
+
+    def iter_files():
+        if recursive:
+            for root, _, files in os.walk(folder):
+                for f in files:
+                    yield os.path.join(root, f)
+        else:
+            for f in os.listdir(folder):
+                yield os.path.join(folder, f)
+
+    # ---- Progress tracking: compute total supported files once ----
+    total = 0
+    for p in iter_files():
+        if os.path.splitext(p)[1].lower() in SUPPORTED_EXTS:
+            total += 1
+
+    parsed = 0
+    already_have_lyrics = 0
+    errors = 0
+    current_path = ""
+    last_progress_print = 0.0
+
+    def print_progress(force=False):
+        nonlocal last_progress_print
+        now = time.time()
+        if not force:
+            if (parsed % PROGRESS_EVERY != 0) and ((now - last_progress_print) < HEARTBEAT_SECONDS):
+                return
+        last_progress_print = now
+        left = total - parsed
+        pct = (parsed / total * 100.0) if total else 100.0
+        print(
+            f"Progress: {pct:6.2f}% | parsed {parsed}/{total} | already_have_lyrics: {already_have_lyrics} | errors: {errors} | left: {left}\n"
+            f"  current: {current_path}",
+            flush=True
+        )
+
+    print_progress(force=True)
+
+    seen = processed = skipped_fast = 0
+
+    for path in iter_files():
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SUPPORTED_EXTS:
+            continue
+
+        current_path = path
+
+        seen += 1
+
+        # Fast skip by log status (no stat, no mutagen)
+        entry = log.get(path)
+        if entry and entry.get("status") in SKIP_STAT_IF_STATUS_IN:
+            skipped_fast += 1
+            if entry.get("status") == "already_present":
+                already_have_lyrics += 1
+            parsed += 1
+            print_progress()
+            continue
+
+        # Raw AAC is usually ADTS with no standard tag container -> skip
+        if ext == ".aac":
+            try:
+                sig = file_signature(path)
+            except Exception:
+                errors += 1
+                parsed += 1
+                print_progress()
+                continue
+            log_update(path, sig, "unsupported_container", note="raw_aac_adts")
+            parsed += 1
+            print_progress()
+            continue
+
+        kind = EXT_KIND.get(ext)
+        if not kind:
+            parsed += 1
+            print_progress()
+            continue
+
+        # Signature-based skip (one stat)
+        try:
+            sig = file_signature(path)
+        except Exception:
+            errors += 1
+            parsed += 1
+            print_progress()
+            continue
+
+        if entry and entry.get("size") == sig["size"] and entry.get("mtime") == sig["mtime"]:
+            if entry.get("status") == "lyrics_not_found" and RETRY_LYRICS_NOT_FOUND:
+                pass
+            else:
+                if entry.get("status") == "already_present":
+                    already_have_lyrics += 1
+                parsed += 1
+                print_progress()
+                continue
+
+        processed += 1
+
+        try:
+            if has_lyrics_by_kind(kind, path):
+                log_update(path, sig, "already_present")
+                already_have_lyrics += 1
+                parsed += 1
+                print_progress()
+                continue
+
+            artist, title = get_artist_title_by_kind(kind, path)
+        except (MP4StreamInfoError, Exception) as e:
+            log_update(path, sig, "error", error=str(e))
+            errors += 1
+            parsed += 1
+            print_progress()
+            continue
+
+        # Fallback to filename parsing
+        if not artist or not title:
+            fa, ft = parse_artist_title_from_filename(path)
+            artist = artist or fa
+            title  = title  or ft
+
+        if not artist or not title:
+            log_update(path, sig, "missing_artist_title")
+            parsed += 1
+            print_progress()
+            continue
+
+        lyrics = fetch_lyrics(artist, title)
+        if not lyrics:
+            log_update(path, sig, "lyrics_not_found", artist=artist, title=title)
+            parsed += 1
+            print_progress()
+            continue
+
+        if dry_run:
+            log_update(path, sig, "dry_run_would_embed", artist=artist, title=title, chars=len(lyrics))
+            parsed += 1
+            print_progress()
+            continue
+
+        ok, err = safe_embed(kind, path, lyrics)
+        if ok:
+            log_update(path, sig, "embedded", artist=artist, title=title, chars=len(lyrics), kind=kind)
+        else:
+            log_update(path, sig, "write_failed", artist=artist, title=title, error=err, kind=kind)
+            errors += 1
+
+        parsed += 1
+        print_progress()
+        time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
+
+    maybe_flush(True)
+    print_progress(force=True)
+
+    print("\n================ Summary ================")
+    print(f"Files seen (supported) : {seen}")
+    print(f"Processed this run     : {processed}")
+    print(f"Skipped fast via log   : {skipped_fast}")
+    print(f"Log path               : {LOG_PATH}")
+    print("========================================\n")
+
+# ----------------------------
+# Mount Drive (safe: don't force remount)
+# ----------------------------
+from google.colab import drive
+if not os.path.isdir("/content/drive/MyDrive"):
+    drive.mount("/content/drive")
+
+# ----------------------------
+# Run
+# ----------------------------
+MUSIC_FOLDER = "/content/drive/MyDrive/MyMusic"  # change me to your music collection folder
+process_folder(MUSIC_FOLDER, dry_run=False, recursive=True)
